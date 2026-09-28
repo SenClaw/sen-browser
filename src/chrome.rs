@@ -81,6 +81,15 @@ pub fn profile_dir(data_dir: &Path, profile: &str) -> Result<PathBuf> {
     Ok(data_dir.join("profiles").join(profile))
 }
 
+/// On macOS Chrome encrypts cookies with a key from the login keychain and
+/// blocks its first network request until it gets one. A HOME without a
+/// keychain (a scratch or service account) would therefore hang every page
+/// load, so Chrome gets its built-in mock keychain there. A real account keeps
+/// the keychain: the managed profile's sign-ins stay encrypted with it.
+fn needs_mock_keychain(home: Option<&Path>) -> bool {
+    cfg!(target_os = "macos") && !home.map(|h| h.join("Library/Keychains").is_dir()).unwrap_or(false)
+}
+
 pub struct ManagedChrome {
     pub conn: Arc<WsConnection>,
     pub profile_dir: PathBuf,
@@ -111,6 +120,9 @@ impl ManagedChrome {
             .arg("--window-size=1120,860");
         if headless {
             cmd.arg("--headless=new");
+        }
+        if needs_mock_keychain(std::env::var_os("HOME").map(PathBuf::from).as_deref()) {
+            cmd.arg("--use-mock-keychain");
         }
         cmd.arg("about:blank").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
         let mut child = cmd
@@ -259,5 +271,15 @@ mod tests {
         assert!(profile_dir(base, "../etc").is_err());
         assert!(profile_dir(base, "").is_err());
         assert!(profile_dir(base, "Upper").is_err());
+    }
+
+    #[test]
+    fn mock_keychain_only_without_a_login_keychain() {
+        let bare = tempfile::tempdir().unwrap();
+        let account = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(account.path().join("Library/Keychains")).unwrap();
+        assert!(!needs_mock_keychain(Some(account.path())), "a real account keeps its keychain");
+        assert_eq!(needs_mock_keychain(Some(bare.path())), cfg!(target_os = "macos"));
+        assert_eq!(needs_mock_keychain(None), cfg!(target_os = "macos"));
     }
 }

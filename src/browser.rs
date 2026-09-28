@@ -47,6 +47,7 @@ pub struct Browser {
     tabs: RwLock<HashMap<String, (Arc<Tab>, String)>>,
     relay: RwLock<Option<Arc<RelayConn>>>,
     seq: AtomicU64,
+    epoch: String,
 }
 
 impl Browser {
@@ -59,11 +60,14 @@ impl Browser {
             tabs: RwLock::new(HashMap::new()),
             relay: RwLock::new(None),
             seq: AtomicU64::new(1),
+            epoch: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
         })
     }
 
+    /// Ids carry this process's epoch: after a restart a caller's remembered
+    /// `t2` must name nothing, never the new process's `t2` (another chat's tab).
     fn next(&self, prefix: &str) -> String {
-        format!("{prefix}{}", self.seq.fetch_add(1, Ordering::SeqCst))
+        format!("{prefix}{}-{}", self.epoch, self.seq.fetch_add(1, Ordering::SeqCst))
     }
 
     fn pids_file(&self) -> PathBuf {

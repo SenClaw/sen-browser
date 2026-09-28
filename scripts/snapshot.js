@@ -115,8 +115,12 @@ function (maxCandidates, textChars, markerOnly) {
         const editable = !e.readOnly && e.getAttribute('aria-readonly') !== 'true' &&
           (['textbox', 'searchbox', 'spinbutton'].includes(rname) ||
             (rname === 'combobox' && ['INPUT', 'TEXTAREA'].includes(e.tagName)));
-        const value = 'value' in e && e.tagName !== 'BUTTON' ? String(e.value) :
+        const raw = 'value' in e && e.tagName !== 'BUTTON' ? String(e.value) :
           e.isContentEditable || rname === 'combobox' ? e.innerText.trim() : '';
+        // A card number, CVV or code the person typed never leaves the page:
+        // the model only learns that the field is filled.
+        const value = base.sensitive ? '' : raw;
+        if (base.sensitive && raw) base.filled = true;
         actions.push({ ...base, kind: editable ? 'fill' : 'click', value });
         if (editable) actions.push({ ...base, kind: 'click', value, label: 'Open ' + base.label });
       }
@@ -155,7 +159,14 @@ function (maxCandidates, textChars, markerOnly) {
   const active = document.activeElement;
   if (active && active !== document.body && (active.isContentEditable || active.tagName === 'TEXTAREA' ||
     (active.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'hidden', 'password'].includes(active.type)))) {
-    actions.push({ id: 'key_enter', kind: 'key', key: 'Enter', label: 'Press Enter in ' + (name(active) || role(active) || 'the focused field') });
+    // Enter submits: what it would submit decides whether it needs the person.
+    const enter = { id: 'key_enter', kind: 'key', key: 'Enter', label: 'Press Enter in ' + (name(active) || role(active) || 'the focused field') };
+    if (active.tagName === 'TEXTAREA' || active.isContentEditable) enter.multiline = true;
+    const form = active.form || active.closest('form');
+    if (active.type === 'search' || role(active) === 'searchbox' || (form && form.getAttribute('role') === 'search')) enter.search = true;
+    const submit = form && form.querySelector('button[type=submit], input[type=submit], button:not([type])');
+    if (submit) enter.submit = name(submit) || submit.value || '';
+    actions.push(enter);
   }
   if (history.length > 1) actions.push({ id: 'go_back', kind: 'back', label: 'Go back to the previous page' });
   actions.push({ id: 'wait', kind: 'wait', label: 'Wait for the page to update' });

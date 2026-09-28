@@ -588,10 +588,15 @@ impl Tab {
         if index <= 0 {
             return Err(BrowserError::InvalidTarget("there is no previous page".into()));
         }
-        let entry = history
-            .pointer(&format!("/entries/{}/id", index - 1))
+        let previous = history
+            .pointer(&format!("/entries/{}", index - 1))
             .cloned()
             .ok_or_else(|| BrowserError::Internal("navigation history without the previous entry".into()))?;
+        // History can hold what `Page.navigate` refuses (a shared tab's `file:` page).
+        if !previous.get("url").and_then(Value::as_str).is_some_and(crate::allowlist::is_web_url) {
+            return Err(BrowserError::InvalidTarget("the previous page is not a web page".into()));
+        }
+        let entry = previous.get("id").cloned().unwrap_or(Value::Null);
         self.send("Page.navigateToHistoryEntry", json!({ "entryId": entry })).await?;
         Ok(())
     }

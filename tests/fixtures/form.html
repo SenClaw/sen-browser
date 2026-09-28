@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SenBrowser fixture</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  #covered { position: fixed; left: 10px; top: 10px; }
+  #overlay { position: fixed; left: 0; top: 0; width: 320px; height: 60px; background: rgba(0, 0, 0, 0.02); }
+  main { margin-top: 80px; display: grid; gap: 6px; max-width: 520px; }
+  .spacer { height: 2400px; }
+</style>
+</head>
+<body>
+<div id="log">log:</div>
+<button id="covered">Covered button</button>
+<div id="overlay"></div>
+<main>
+  <h1>Fixture</h1>
+  <label for="dest">Destination</label> <input id="dest" type="text" value="Paris">
+  <label for="pw">Password</label> <input id="pw" type="password">
+  <label for="otp">One-time code</label> <input id="otp" type="text" autocomplete="one-time-code">
+  <label for="cat">Category</label>
+  <select id="cat"><option value="any">Any</option><option value="design">Design</option><option value="hostel" disabled>Hostel</option></select>
+  <label><input id="free" type="checkbox"> Free cancellation</label>
+  <button id="search">Search</button>
+  <button id="arm">Arm change</button>
+  <button id="target">Target</button>
+  <button id="check">Check isolation</button>
+  <div><label for="city">City</label> <input id="city" role="combobox" aria-controls="city-list" aria-expanded="false" autocomplete="off"></div>
+  <ul id="city-list" role="listbox"></ul>
+  <div><label for="query">Query</label> <input id="query" type="text"></div>
+  <button id="confirm">Confirm</button>
+  <sen-widget></sen-widget>
+  <iframe id="frame" src="/frame.html" width="300" height="60"></iframe>
+  <a href="/other.html">Other page</a>
+</main>
+<div class="spacer"></div>
+<script>
+  const log = m => { document.getElementById('log').textContent += ' | ' + m; };
+  document.getElementById('search').addEventListener('click', e => log('search trusted=' + e.isTrusted));
+  document.getElementById('covered').addEventListener('click', () => log('covered clicked'));
+  document.getElementById('dest').addEventListener('input', e => log('dest=' + e.target.value + ' trusted=' + e.isTrusted));
+  document.getElementById('cat').addEventListener('change', e => log('cat=' + e.target.value));
+  document.getElementById('free').addEventListener('change', e => log('free=' + e.target.checked));
+  document.getElementById('arm').addEventListener('click', () => setTimeout(() => {
+    document.getElementById('target').textContent = 'Target (changed)';
+  }, 600));
+  document.getElementById('target').addEventListener('click', () => log('target clicked'));
+  document.getElementById('check').addEventListener('click', () => log('senclaw=' + typeof window.__senclaw));
+  const city = document.getElementById('city'), list = document.getElementById('city-list');
+  city.addEventListener('input', () => {
+    list.innerHTML = '';
+    city.setAttribute('aria-expanded', 'false');
+    const q = city.value;
+    setTimeout(() => {
+      if (city.value !== q) return;
+      for (const name of ['Zürich, Switzerland', 'Zurich Airport']) {
+        const li = document.createElement('li');
+        li.setAttribute('role', 'option');
+        li.textContent = name;
+        li.addEventListener('click', () => { city.value = name; log('city=' + name); list.innerHTML = ''; });
+        list.appendChild(li);
+      }
+      city.setAttribute('aria-expanded', 'true');
+    }, 80);
+  });
+  document.getElementById('query').addEventListener('keydown', e => {
+    if (e.key === 'Enter') log('enter trusted=' + e.isTrusted + ' q=' + e.target.value);
+  });
+  document.getElementById('confirm').addEventListener('click', () => { const ok = confirm('Proceed?'); log('confirm=' + ok); });
+  customElements.define('sen-widget', class extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = '<button>Shadow button</button>';
+      root.querySelector('button').addEventListener('click', e => log('shadow trusted=' + e.isTrusted));
+    }
+  });
+</script>
+</body>
+</html>

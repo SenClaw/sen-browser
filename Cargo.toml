@@ -1,0 +1,42 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "sen-browser"
+version = "0.1.0"
+edition = "2021"
+description = "SenClaw browser runtime: atomic page observation and guarded, trusted input over CDP, for a managed Chrome profile or the user's Chrome through the SenClaw extension"
+license = "MIT"
+repository = "https://github.com/SenClaw/sen-browser"
+
+[[bin]]
+name = "sen-browser"
+path = "src/main.rs"
+
+[lib]
+name = "sen_browser"
+path = "src/lib.rs"
+
+[dependencies]
+sen-runtime-sdk = { path = "../senclaw/crates/sen-runtime-sdk" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+async-trait = "0.1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json", "ws"] }
+tokio-tungstenite = "0.24"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

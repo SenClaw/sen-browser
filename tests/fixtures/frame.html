@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+<body style="margin:4px">
+<button id="fb">Frame button</button>
+<script>
+  document.getElementById('fb').addEventListener('click', e => {
+    parent.document.getElementById('log').textContent += ' | frame trusted=' + e.isTrusted;
+  });
+</script>
+</body>
+</html>

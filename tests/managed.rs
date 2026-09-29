@@ -213,3 +213,16 @@ async fn navigate_read_screenshot_back_and_handover_gate() {
     tab.observe(None, None).await.unwrap();
     browser.shutdown().await;
 }
+
+/// A headless page is told the browser is an ordinary Chrome: sites answer
+/// "HeadlessChrome" with a bot wall (DuckDuckGo's challenge on every search).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_headless_page_sees_an_ordinary_chrome() {
+    let Some((browser, _dir)) = browser() else { return };
+    let base = serve_fixtures().await;
+    let session = browser.open_session(DriverKind::Managed, Some("ua"), Some(true)).await.unwrap();
+    let (tab, _) = browser.open_tab(&session, None, Some("chat-ua")).await.unwrap();
+    tab.navigate(&format!("{base}/ua-echo")).await.unwrap();
+    let text = page_log(&tab).await;
+    assert!(text.contains("Chrome/") && !text.contains("Headless"), "{text}");
+}

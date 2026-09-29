@@ -90,6 +90,32 @@ fn needs_mock_keychain(home: Option<&Path>) -> bool {
     cfg!(target_os = "macos") && !home.map(|h| h.join("Library/Keychains").is_dir()).unwrap_or(false)
 }
 
+/// The major version a Chromium-family binary reports (`Google Chrome
+/// 154.0.8037.57` → 154). Windows builds print nothing to a console, so there
+/// it is `None` and the browser keeps its own user agent.
+async fn major_version(binary: &Path) -> Option<u32> {
+    let run = Command::new(binary).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output();
+    let out = tokio::time::timeout(Duration::from_secs(5), run).await.ok()?.ok()?;
+    parse_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_major(text: &str) -> Option<u32> {
+    text.split_whitespace().find_map(|w| w.split('.').next()?.parse::<u32>().ok().filter(|v| *v >= 80))
+}
+
+/// What that Chrome sends when it has a window (the reduced user agent: only
+/// the major version is real).
+fn desktop_user_agent(major: u32) -> String {
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    format!("Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+}
+
 pub struct ManagedChrome {
     pub conn: Arc<WsConnection>,
     pub profile_dir: PathBuf,
@@ -120,6 +146,14 @@ impl ManagedChrome {
             .arg("--window-size=1120,860");
         if headless {
             cmd.arg("--headless=new");
+            // Sites turn a headless Chrome away on sight: its user agent says
+            // "HeadlessChrome" (DuckDuckGo answers every search with a bot
+            // challenge) and `navigator.webdriver` is set. It is the same
+            // browser with a window or without, so it says what that one says.
+            cmd.arg("--disable-blink-features=AutomationControlled");
+            if let Some(major) = major_version(binary).await {
+                cmd.arg(format!("--user-agent={}", desktop_user_agent(major)));
+            }
         }
         if needs_mock_keychain(std::env::var_os("HOME").map(PathBuf::from).as_deref()) {
             cmd.arg("--use-mock-keychain");
@@ -262,6 +296,16 @@ unsafe fn libc_kill(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_headless_chrome_introduces_itself_as_chrome() {
+        assert_eq!(parse_major("Google Chrome 154.0.8037.57\n"), Some(154));
+        assert_eq!(parse_major("Google Chrome for Testing 153.0.8010.12"), Some(153));
+        assert_eq!(parse_major("Brave Browser 130.1.71.118"), Some(130));
+        assert_eq!(parse_major(""), None);
+        let ua = desktop_user_agent(154);
+        assert!(ua.contains(" Chrome/154.0.0.0 ") && !ua.contains("Headless"), "{ua}");
+    }
 
     #[test]
     fn profile_names_are_directory_safe() {

@@ -14,7 +14,19 @@ use sen_browser::Browser;
 /// Serve `tests/fixtures` on a random loopback port; returns the base URL.
 pub async fn serve_fixtures() -> String {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let app = Router::new().route(
+    let app = Router::new()
+        // What the browser says it is, as a page.
+        .route(
+            "/ua-echo",
+            get(|headers: axum::http::HeaderMap| async move {
+                let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                Response::builder()
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(Body::from(format!("<!doctype html><title>ua</title><p id=ua>{ua}</p>")))
+                    .unwrap()
+            }),
+        )
+        .route(
         "/:name",
         get(move |axum::extract::Path(name): axum::extract::Path<String>| {
             let dir = dir.clone();

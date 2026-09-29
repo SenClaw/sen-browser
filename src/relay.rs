@@ -106,9 +106,12 @@ impl RelayConn {
                 });
             }
             Some("detached") => {
+                // The person took the tab back: an unadopted share is withdrawn too.
+                self.shared.lock().await.retain(|s| s.get("tab").and_then(Value::as_i64) != tab);
                 let _ = self.events.send(internal("Sen.detached"));
             }
             Some("tab_closed") => {
+                self.shared.lock().await.retain(|s| s.get("tab").and_then(Value::as_i64) != tab);
                 let _ = self.events.send(internal("Sen.tabClosed"));
             }
             Some("user_active") => {
@@ -241,6 +244,15 @@ mod tests {
         relay.handle_frame(&json!({ "ch": "drv", "t": "shared_tab", "tab": 9, "url": "https://b.test" }).to_string()).await;
         assert_eq!(relay.shared_tabs().await.len(), 1);
         assert!(relay.take_shared(9).await.is_some());
+        // A share the person takes back, or closes, is no longer offered.
+        for gone in [json!({ "t": "detached", "tab": 10, "reason": "stopped_by_user" }), json!({ "t": "tab_closed", "tab": 11 })] {
+            let tab = gone["tab"].as_i64().unwrap();
+            relay.handle_frame(&json!({ "ch": "drv", "t": "shared_tab", "tab": tab, "url": "https://c.test" }).to_string()).await;
+            let mut frame = gone.clone();
+            frame["ch"] = json!("drv");
+            relay.handle_frame(&frame.to_string()).await;
+            assert!(relay.take_shared(tab).await.is_none(), "{gone}");
+        }
 
         let r = relay.clone();
         let waiter = tokio::spawn(async move { r.request("attach", json!({ "tab": 5 })).await });

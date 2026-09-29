@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "sen-browser",
   "name": "SenClaw Browser Engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Chrome over CDP: atomic page observation, guarded trusted input and handover, for a managed profile or the user's Chrome through the SenClaw extension",
   "type": "browser",
   "slots": ["browser"],
@@ -18,6 +18,6 @@
   "health": { "path": "/health", "startupTimeoutSecs": 30 },
   "idleTimeoutSecs": 1800,
   "homepage": "https://github.com/SenClaw/sen-browser",
-  "releaseNotesUrl": "https://github.com/SenClaw/sen-browser/releases/tag/v0.1.0",
+  "releaseNotesUrl": "https://github.com/SenClaw/sen-browser/releases/tag/v0.1.1",
   "license": "MIT"
 }

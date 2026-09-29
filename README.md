@@ -68,3 +68,15 @@ make run-dev        # standalone on :4970, no token
 
 `SEN_BROWSER_CHROME` points at a specific browser binary; `SEN_BROWSER_HEADFUL=1`
 launches managed Chrome with a window.
+
+## Install and release
+
+SenClaw installs the runtime from its catalog (Settings → Runtime → Engines &
+Frameworks, type *Browser*) once a release is published: pushing a `v*` tag runs
+`.github/workflows/release.yml`, which attaches
+`sen-browser-<version>-<platform>.tar.gz` (+ `.sha256`) for darwin-arm64,
+linux-x64 and windows-x64; the daemon's `runtimes/index.json` then lists each
+archive's URL, sha256 and size. Until then, `make package` and use **Install
+from a local path** with the archive (desktop and web), or
+`senclaw runtime install-local dist/<archive>` — never against a live
+`~/.senclaw` while developing.

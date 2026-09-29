@@ -28,7 +28,10 @@ async fn observes_in_an_isolated_world_and_acts_with_trusted_input() {
     assert_eq!(dest["value"], "Paris");
     let actions = obs["actions"].as_array().unwrap();
     assert!(!actions.iter().any(|a| a["label"].as_str().unwrap_or_default().contains("Password")), "password fields are never offered");
-    assert_eq!(action(&obs, "fill", "One-time code")["sensitive"], true);
+    let otp = action(&obs, "fill", "One-time code");
+    assert_eq!(otp["sensitive"], true);
+    assert_eq!((otp["value"].as_str(), otp["filled"].as_bool()), (Some(""), Some(true)), "only that it is filled");
+    assert!(!obs.to_string().contains("482913"), "a sensitive value never leaves the runtime");
     action(&obs, "select", "Category → Design");
     assert!(!actions.iter().any(|a| a["label"].as_str().unwrap_or_default().contains("Hostel")), "disabled options are not offered");
     assert_eq!(action(&obs, "click", "Free cancellation")["checked"], "false");

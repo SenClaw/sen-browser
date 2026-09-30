@@ -227,6 +227,70 @@ async fn a_headless_page_sees_an_ordinary_chrome() {
     assert!(text.contains("Chrome/") && !text.contains("Headless"), "{text}");
 }
 
+/// A page is observed when it shows what a person would act on — not when its
+/// last resource arrives (a tracker can hold the load event for seconds, or
+/// for good), and not before an app shell has fetched its content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_is_observed_when_it_is_usable() {
+    let Some((browser, _dir)) = browser() else { return };
+    let base = serve_fixtures().await;
+    let session = browser.open_session(DriverKind::Managed, Some("ready"), Some(true)).await.unwrap();
+    let (tab, _) = browser.open_tab(&session, None, Some("chat-ready")).await.unwrap();
+
+    // The load event is six seconds away; the post is there at once.
+    let started = std::time::Instant::now();
+    let obs = tab.navigate(&format!("{base}/feed.html?slow=6000")).await.unwrap();
+    let took = started.elapsed();
+    action(&obs, "click", "Like first post");
+    assert!(took < Duration::from_secs(4), "waited {took:?} for a page that was usable at once");
+    assert_ne!(obs["timing_ms"]["ready_by"], "load", "{}", obs["timing_ms"]);
+
+    // The second post is brought by the page's own script, half a second later.
+    let obs = tab.navigate(&format!("{base}/feed.html?late=500")).await.unwrap();
+    action(&obs, "click", "Like second post");
+
+    // A document that loads no script is complete at its load event: no wait.
+    let obs = tab.navigate(&format!("{base}/other.html")).await.unwrap();
+    assert_eq!(obs["timing_ms"]["ready_by"], "load", "{}", obs["timing_ms"]);
+
+    // Both at once: late content, and a load event that is still waiting.
+    let started = std::time::Instant::now();
+    let obs = tab.navigate(&format!("{base}/feed.html?late=500&slow=6000")).await.unwrap();
+    action(&obs, "click", "Like second post");
+    assert!(started.elapsed() < Duration::from_secs(4), "waited {:?}", started.elapsed());
+    browser.shutdown().await;
+}
+
+/// A click that starts a navigation is followed to the page it brings, however
+/// long the server takes: the next step is never decided on the page being left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_click_that_navigates_returns_the_new_page() {
+    let Some((browser, _dir)) = browser() else { return };
+    let base = serve_fixtures().await;
+    let session = browser.open_session(DriverKind::Managed, Some("follow"), Some(true)).await.unwrap();
+    let (tab, _) = browser.open_tab(&session, None, Some("chat-follow")).await.unwrap();
+    let obs = tab.navigate(&format!("{base}/feed.html")).await.unwrap();
+
+    let out = tab.act(obs_id(&obs), &id(action(&obs, "click", "Open slowly")), None).await.unwrap();
+    assert_eq!(out["observation"]["title"], "Slow page", "{out}");
+    assert!(out["ready_by"].is_string(), "the navigation was followed: {out}");
+
+    // And back: the feed again, without waiting out a load that will not come.
+    let obs = out["observation"].clone();
+    let started = std::time::Instant::now();
+    let out = tab.act(obs_id(&obs), "go_back", None).await.unwrap();
+    assert_eq!(out["observation"]["title"], "Feed fixture", "{out}");
+    assert!(started.elapsed() < Duration::from_secs(3), "going back took {:?}", started.elapsed());
+
+    // An action that stays on the page is not held up.
+    let obs = out["observation"].clone();
+    let started = std::time::Instant::now();
+    let out = tab.act(obs_id(&obs), &id(action(&obs, "click", "Like first post")), None).await.unwrap();
+    assert!(out["ready_by"].is_null(), "{out}");
+    assert!(started.elapsed() < Duration::from_millis(800), "a plain click took {:?}", started.elapsed());
+    browser.shutdown().await;
+}
+
 /// A toggle button (like, follow, mute) reports whether it is on, and a
 /// toggle that changed by itself since it was observed is not clicked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

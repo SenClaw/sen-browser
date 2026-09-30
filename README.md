@@ -35,6 +35,30 @@ and settle logic in `src/tab.rs`.
 - Model output never becomes selectors, coordinates or code: an action is an
   id from the latest observation.
 
+## When a page is ready
+
+A navigation — `navigate`, or an action that starts one (a link, a submitted
+form, going back) — is followed to the document it brings, and that document
+is observed when it shows what a person would act on. The load event alone is
+the wrong signal in both directions: a video stream, an ad or a tracker can
+hold it back for many seconds (or for good) while the page is usable, and an
+app shell fires it before fetching what it will show. `wait_ready` in
+`src/tab.rs` ends the wait on the first of:
+
+| `ready_by` | The document… |
+|---|---|
+| `load` | fired its load event and is not an app shell: it already shows a full page, or loads no script that could fill it in |
+| `quiet` | is parsed, its network went quiet and what it shows stopped changing. Quiet is Chrome's own idle detection: before the load event at most two requests in flight (stragglers), after it none (one request may be all an app's data) |
+| `stable` | is parsed and what it shows has stayed the same for 1.5 s (a network that never goes quiet) |
+| `grace` | has been parsed for 4 s |
+| `deadline` | did not arrive within 15 s |
+| `restored`, `same_document`, `cancelled`, `dialog` | came back from the back/forward cache, never left the document, was cancelled (a download), or is blocked by a dialog |
+
+An observation after `navigate` carries `timing_ms.ready` and
+`timing_ms.ready_by`; an `act` answer carries `ready_ms` and `ready_by` (null
+when the action started no navigation). Chrome holds every call to a page
+while a navigation is pending, so nothing is read from the page being left.
+
 ## API (bearer token on every route but `/health`)
 
 ```
@@ -45,7 +69,7 @@ DELETE /v1/sessions/:sid
 GET    /v1/sessions/:sid/tabs         · POST {url?, owner?, ext_tab?}  → {tab, created, observation}
 DELETE /v1/tabs/:tid
 POST   /v1/tabs/:tid/observe          {text_chars?, max_candidates?}  → observation
-POST   /v1/tabs/:tid/act              {observation_id, action_id, text?} → {executed, settle_ms, observation}
+POST   /v1/tabs/:tid/act              {observation_id, action_id, text?} → {executed, executed_ms, settle_ms, ready_ms, ready_by, observation}
 POST   /v1/tabs/:tid/navigate         {url}
 POST   /v1/tabs/:tid/read             {max_chars?}  → {url, title, text, links}
 POST   /v1/tabs/:tid/screenshot       → {mime, data}

@@ -15,6 +15,7 @@ use crate::scripts;
 /// script in every frame), so a method is only as safe as its parameters.
 const ALLOWED: &[(&str, &[&str])] = &[
     ("Page.enable", &[]),
+    ("Page.setLifecycleEventsEnabled", &["enabled"]),
     ("Page.getFrameTree", &[]),
     ("Page.navigate", &["url"]),
     ("Page.getNavigationHistory", &[]),
@@ -163,6 +164,7 @@ mod tests {
         assert!(check("Input.dispatchMouseEvent", &json!({"type": "mousePressed"})).is_ok());
         assert!(check("Input.insertText", &json!({"text": "x"})).is_ok());
         assert!(check("Page.navigate", &json!({"url": "https://example.com"})).is_ok());
+        assert!(check("Page.setLifecycleEventsEnabled", &json!({"enabled": true})).is_ok());
         assert!(check("Target.setAutoAttach", &json!({"flatten": false})).is_err());
     }
 

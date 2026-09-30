@@ -26,6 +26,39 @@ pub async fn serve_fixtures() -> String {
                     .unwrap()
             }),
         )
+        // A 1×1 image that arrives `ms` late: what keeps a page's load event
+        // waiting while everything a person would use is already there.
+        .route(
+            "/slow-pixel",
+            get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, u64>>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(q.get("ms").copied().unwrap_or(0).min(30_000))).await;
+                const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x01D\x00;";
+                Response::builder().header("content-type", "image/gif").body(Body::from(GIF)).unwrap()
+            }),
+        )
+        // The script of an app shell: what the page shows arrives `ms` after it ran.
+        .route(
+            "/late.js",
+            get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, u64>>| async move {
+                let ms = q.get("ms").copied().unwrap_or(0).min(30_000);
+                let js = format!(
+                    "setTimeout(() => {{ document.getElementById('more').innerHTML = \
+                     '<article><p>Second post</p><button>Like second post</button></article>'; }}, {ms});"
+                );
+                Response::builder().header("content-type", "text/javascript").body(Body::from(js)).unwrap()
+            }),
+        )
+        // A page whose server answers `ms` late.
+        .route(
+            "/slow-page",
+            get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, u64>>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(q.get("ms").copied().unwrap_or(0).min(30_000))).await;
+                Response::builder()
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(Body::from("<!doctype html><title>Slow page</title><h1>Slow page</h1><p>It took its time.</p>"))
+                    .unwrap()
+            }),
+        )
         .route(
         "/:name",
         get(move |axum::extract::Path(name): axum::extract::Path<String>| {

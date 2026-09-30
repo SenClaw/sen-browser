@@ -14,12 +14,32 @@
   <p>First post</p>
   <button id="like" aria-pressed="false" aria-label="Like first post">Like</button>
   <button id="flip">Flip the like</button>
+  <a href="/slow-page?ms=700">Open slowly</a>
 </article>
+<div id="more"></div>
 <script>
+  // ?late=<ms>: the page loads a script that adds a second post that long
+  // after it ran, the way an app shell fetches what it shows. ?slow=<ms>: a
+  // subresource holds the load event back that long.
+  const params = new URLSearchParams(location.search);
   const like = document.getElementById('like');
   like.addEventListener('click', () => like.setAttribute('aria-pressed', String(like.getAttribute('aria-pressed') !== 'true')));
   // The page turns the like on by itself, a moment after being asked to.
   document.getElementById('flip').addEventListener('click', () => setTimeout(() => like.setAttribute('aria-pressed', 'true'), 300));
+  const late = Number(params.get('late') || 0);
+  if (late > 0) {
+    // As an app does it: a script of its own brings the rest.
+    const app = document.createElement('script');
+    app.src = '/late.js?ms=' + late;
+    document.head.appendChild(app);
+  }
+  const slow = Number(params.get('slow') || 0);
+  if (slow > 0) {
+    const pixel = new Image();
+    pixel.alt = '';
+    pixel.src = '/slow-pixel?ms=' + slow;
+    document.body.appendChild(pixel);
+  }
 </script>
 </body>
 </html>

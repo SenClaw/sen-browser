@@ -148,6 +148,23 @@ function (maxCandidates, textChars, markerOnly) {
   const semantics = actions.map(({ rect, ...action }) => action);
   const marker = [performance.timeOrigin, location.href, scrollX, scrollY, innerWidth, innerHeight,
     document.title, text, semantics, page_key[6]];
+  if (markerOnly === 'probe') {
+    // For the wait on a navigating page, asked several times a second: a
+    // digest of the marker instead of the marker, and how much the page shows.
+    // With no script of its own to fetch, a document cannot be an app shell
+    // that fills in later.
+    const json = JSON.stringify(marker);
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < json.length; i++) {
+      const c = json.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 2654435761);
+      h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return { digest: 4294967296 * (2097151 & h2) + (h1 >>> 0), text: text.trim().length, controls: semantics.length,
+      scripts: document.querySelectorAll('script[src]').length };
+  }
   if (markerOnly) return { marker };
 
   const guards = {};

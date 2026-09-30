@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::allowlist;
-use crate::cdp::{CdpError, TabChannel};
+use crate::cdp::{CdpError, CdpEvent, TabChannel};
 use crate::error::{BrowserError, Result};
 use crate::observation::{self, Stored, DEFAULT_MAX_CANDIDATES, DEFAULT_TEXT_CHARS};
 use crate::scripts::{self, Script};
@@ -23,8 +23,26 @@ use crate::scripts::{self, Script};
 const OBSERVE_DEADLINE: Duration = Duration::from_secs(10);
 /// Settle waits are capped at 200 ms inside the page; this bounds a wedged one.
 const SETTLE_DEADLINE: Duration = Duration::from_millis(1500);
-/// Navigation: wait this long for the load event before observing anyway.
+/// The settle's share once the action asked for a navigation.
+const NAVIGATING_SETTLE: Duration = Duration::from_millis(120);
+/// Navigation: how long a new document may take to arrive and be parsed.
 const LOAD_DEADLINE: Duration = Duration::from_secs(15);
+/// A parsed document gets this long to finish rendering before it is
+/// observed as it is.
+const READY_GRACE: Duration = Duration::from_secs(4);
+/// With no word from the network, what the page shows has to stay the same
+/// this long to count as rendered (a page that streams video never goes quiet).
+const STABLE_FOR: Duration = Duration::from_millis(1500);
+const READY_POLL: Duration = Duration::from_millis(200);
+/// How long a navigation that stopped without a document may still produce one.
+const CANCEL_LINGER: Duration = Duration::from_millis(400);
+/// How long a navigation that was asked for may take to get under way.
+const START_LINGER: Duration = Duration::from_secs(1);
+/// A page showing this much is taken as it is once its load event fired:
+/// server-rendered pages are complete then. A sparser one that loads scripts
+/// may be an app shell still fetching what it will show.
+const RICH_TEXT_CHARS: usize = 400;
+const RICH_CONTROLS: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,6 +80,133 @@ impl std::fmt::Display for CallError {
     }
 }
 
+/// Where the main frame is in a navigation, read off the page's own events.
+#[derive(Debug, Default, Clone)]
+struct NavWatch {
+    /// A new document was asked for.
+    started: bool,
+    /// It is on its way: until it commits, the page's other events are about
+    /// the document being left.
+    coming: bool,
+    /// The document that committed, by its loader id.
+    loader: Option<String>,
+    /// Its HTML is parsed (`DOMContentLoaded`).
+    parsed: bool,
+    /// Its load event fired.
+    loaded: bool,
+    /// Its network has at most two requests in flight (Chrome's own idle
+    /// detection, half a second of it): only stragglers are left.
+    almost_idle: bool,
+    /// Its network has nothing in flight.
+    idle: bool,
+    /// The navigation ended with nothing further to wait for.
+    settled: Option<&'static str>,
+}
+
+impl NavWatch {
+    /// A navigation to another document is under way.
+    fn coming() -> NavWatch {
+        NavWatch { started: true, coming: true, ..NavWatch::default() }
+    }
+
+    /// Whether the network has nothing more to bring that matters. Before the
+    /// load event what is in flight is the page's own resources: two left are
+    /// stragglers (an ad, a tracker, a video). After it, what is in flight is
+    /// what the page's scripts asked for — one request may be all its data.
+    fn quiet(&self) -> bool {
+        if self.loaded {
+            self.idle
+        } else {
+            self.almost_idle
+        }
+    }
+
+    fn see(&mut self, ev: &CdpEvent, main_frame: &str) {
+        let param = |key: &str| ev.params.get(key).and_then(Value::as_str);
+        let main = || param("frameId") == Some(main_frame);
+        match ev.method.as_str() {
+            "Page.frameNavigated" if ev.params.pointer("/frame/parentId").is_none() => {
+                let loader = ev.params.pointer("/frame/loaderId").and_then(Value::as_str).map(str::to_string);
+                *self = NavWatch { started: true, loader, ..NavWatch::default() };
+                // A page restored from the back/forward cache is already complete.
+                if param("type") == Some("BackForwardCacheRestore") {
+                    self.settled = Some("restored");
+                }
+            }
+            // `frameStartedLoading` is no use here: the history API fires it
+            // too, around a navigation that never leaves the document.
+            "Page.frameStartedNavigating" if main() => {
+                if matches!(param("navigationType"), Some("sameDocument" | "historySameDocument")) {
+                    return;
+                }
+                *self = NavWatch::coming();
+            }
+            // A link that opens a new tab, or a download, leaves this page where it is.
+            "Page.frameRequestedNavigation" if main() && matches!(param("disposition"), None | Some("currentTab")) => {
+                self.started = true
+            }
+            // Loading ended. For the committed document that is its load; with
+            // a document still to come, the navigation was cancelled (a
+            // download, a 204).
+            "Page.frameStoppedLoading" if main() => match (&self.loader, self.coming) {
+                (Some(_), false) => self.loaded = true,
+                _ => self.settled = self.settled.or(Some("cancelled")),
+            },
+            _ if self.coming => return,
+            "Page.domContentEventFired" if self.loader.is_some() => self.parsed = true,
+            "Page.loadEventFired" if self.loader.is_some() => {
+                self.parsed = true;
+                self.loaded = true;
+            }
+            // A fragment or the history API: the document stays.
+            "Page.navigatedWithinDocument" if main() && self.loader.is_none() => self.settled = Some("same_document"),
+            "Page.lifecycleEvent" if main() && self.loader.is_some() && param("loaderId") == self.loader.as_deref() => {
+                match param("name") {
+                    Some("networkAlmostIdle") => self.almost_idle = true,
+                    Some("networkIdle") => (self.almost_idle, self.idle) = (true, true),
+                    _ => return,
+                }
+            }
+            _ => return,
+        }
+        tracing::debug!("page event {} -> {self:?}", ev.method);
+    }
+}
+
+/// What a page shows at one moment of a navigation, cheap enough to ask for
+/// several times a second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Shown {
+    /// A digest of the snapshot marker: changes when what the page shows does.
+    digest: u64,
+    text: usize,
+    controls: usize,
+    /// Scripts the document loads: without any it cannot fill in later.
+    scripts: u64,
+}
+
+impl Shown {
+    fn parse(probe: &Value) -> Option<Shown> {
+        let number = |key: &str| probe.get(key).and_then(Value::as_f64);
+        Some(Shown {
+            digest: number("digest")? as u64,
+            text: number("text")? as usize,
+            controls: number("controls")? as usize,
+            scripts: number("scripts").unwrap_or(1.0) as u64,
+        })
+    }
+
+    fn blank(&self) -> bool {
+        self.text + self.controls == 0
+    }
+
+    /// Whether more may still arrive once the load event fired: an app shell
+    /// is a sparse page that loads scripts.
+    fn may_fill_in(&self) -> bool {
+        self.scripts > 0 && self.text < RICH_TEXT_CHARS && self.controls < RICH_CONTROLS
+    }
+}
+
 pub struct Tab {
     pub id: String,
     pub owner: Option<String>,
@@ -69,6 +214,8 @@ pub struct Tab {
     /// Managed: the CDP target id. Extension: the Chrome tab id.
     target: RwLock<String>,
     channel: RwLock<Arc<dyn TabChannel>>,
+    /// The main frame's id, as the page's navigation events name it.
+    frame: Arc<Mutex<String>>,
     world: Arc<Mutex<Option<i64>>>,
     dialog: Arc<Mutex<Option<Value>>>,
     last_url: Arc<Mutex<String>>,
@@ -99,6 +246,7 @@ impl Tab {
             driver,
             target: RwLock::new(target),
             channel: RwLock::new(channel),
+            frame: Arc::new(Mutex::new(String::new())),
             world: Arc::new(Mutex::new(None)),
             dialog: Arc::new(Mutex::new(None)),
             last_url: Arc::new(Mutex::new(String::new())),
@@ -169,6 +317,7 @@ impl Tab {
         let channel = self.channel.read().await.clone();
         let mut rx = channel.subscribe();
         let world = self.world.clone();
+        let main_frame = self.frame.clone();
         let dialog = self.dialog.clone();
         let last_url = self.last_url.clone();
         let hold = self.hold.clone();
@@ -196,6 +345,9 @@ impl Tab {
                         let frame = ev.params.get("frame").cloned().unwrap_or(Value::Null);
                         if frame.get("parentId").is_none() {
                             *world.lock().await = None;
+                            if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                                *main_frame.lock().await = id.to_string();
+                            }
                             if let Some(u) = frame.get("url").and_then(Value::as_str) {
                                 *last_url.lock().await = u.to_string();
                             }
@@ -231,6 +383,12 @@ impl Tab {
 
     async fn setup(&self) -> Result<()> {
         self.send("Page.enable", json!({})).await?;
+        // Chrome's own word on when a document's network goes quiet. An
+        // extension built before this was asked for refuses it; navigation
+        // then falls back on what the page shows.
+        if let Err(e) = self.send("Page.setLifecycleEventsEnabled", json!({ "enabled": true })).await {
+            tracing::debug!("no lifecycle events for tab {}: {e}", self.id);
+        }
         self.send("Runtime.enable", json!({})).await?;
         // Keeps animation frames and timers running in an owned background tab
         // without activating it in front of the person.
@@ -266,6 +424,7 @@ impl Tab {
             .and_then(Value::as_str)
             .ok_or_else(|| CdpError::Other("the tab has no main frame yet".into()))?
             .to_string();
+        *self.frame.lock().await = frame_id.clone();
         let created = self
             .send_raw(
                 "Page.createIsolatedWorld",
@@ -432,6 +591,9 @@ impl Tab {
         // Consume the observation before any input: a retry of this request can
         // never repeat the action.
         *self.last.lock().await = None;
+        // Hear what the action does to the page: a click may start a navigation.
+        let channel = self.channel.read().await.clone();
+        let mut events = channel.subscribe();
         let started = Instant::now();
         match kind.as_str() {
             "scroll" => {
@@ -479,17 +641,36 @@ impl Tab {
         }
         let executed_ms = started.elapsed().as_millis() as u64;
 
+        // An action that started a navigation is followed to the document it
+        // brings. Chrome holds every call to the page until that document
+        // commits, so the settle gets only a moment then: enough for a
+        // navigation that stays in the document, no wait on a page being left.
+        let frame = self.frame.lock().await.clone();
+        let mut watch = NavWatch { started: kind == "back", ..NavWatch::default() };
+        let hear = |watch: &mut NavWatch, events: &mut tokio::sync::broadcast::Receiver<CdpEvent>| loop {
+            match events.try_recv() {
+                Ok(ev) if channel.owns(&ev) => watch.see(&ev, &frame),
+                Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        };
         let settle_started = Instant::now();
         let dialog_opened = self.dialog.lock().await.is_some();
-        match kind.as_str() {
-            _ if dialog_opened => {}
-            "wait" | "dialog" => {}
-            "back" => self.wait_for_load(Duration::from_secs(5)).await,
-            _ => {
-                let _ = tokio::time::timeout(SETTLE_DEADLINE, self.call(&scripts::SETTLE, vec![json!(node), json!(kind)], true)).await;
-            }
+        hear(&mut watch, &mut events);
+        if !dialog_opened && !matches!(kind.as_str(), "wait" | "dialog" | "back") {
+            let limit = if watch.started { NAVIGATING_SETTLE } else { SETTLE_DEADLINE };
+            let _ = tokio::time::timeout(limit, self.call(&scripts::SETTLE, vec![json!(node), json!(kind)], true)).await;
+            hear(&mut watch, &mut events);
         }
         let settle_ms = settle_started.elapsed().as_millis() as u64;
+
+        let ready_started = Instant::now();
+        let ready = if watch.started && !dialog_opened && kind != "dialog" {
+            Some(self.wait_ready(&mut events, &channel, &mut watch, &frame).await)
+        } else {
+            None
+        };
+        let ready_ms = ready_started.elapsed().as_millis() as u64;
 
         // The action happened; an observation failing now (a slow navigation)
         // must not erase that. The caller observes again.
@@ -502,6 +683,8 @@ impl Tab {
             "kind": kind,
             "executed_ms": executed_ms,
             "settle_ms": settle_ms,
+            "ready_ms": ready_ms,
+            "ready_by": ready,
             "observation": observation,
             "observation_error": observation_error,
         }))
@@ -601,19 +784,107 @@ impl Tab {
         Ok(())
     }
 
-    /// Wait for the main frame to finish loading (or give up after `limit`).
-    async fn wait_for_load(&self, limit: Duration) {
-        let channel = self.channel.read().await.clone();
-        let mut rx = channel.subscribe();
-        let deadline = tokio::time::Instant::now() + limit;
+    /// Wait until the document a navigation brings is worth observing, and say
+    /// what ended the wait.
+    ///
+    /// The load event alone is the wrong signal in both directions. A page may
+    /// hold it back for as long as a video stream, an ad or a tracker takes —
+    /// while everything a person would act on is already there. And an app
+    /// shell fires it before fetching what it will show. So a parsed document
+    /// is ready when its load event fired and it is not such a shell (it
+    /// shows a full page, or loads no script that could fill it in); or when
+    /// its network went quiet and what it shows stopped changing; or, with a
+    /// network that never goes quiet, when what it shows has stayed the same
+    /// for a while.
+    async fn wait_ready(
+        &self,
+        rx: &mut tokio::sync::broadcast::Receiver<CdpEvent>,
+        channel: &Arc<dyn TabChannel>,
+        watch: &mut NavWatch,
+        frame: &str,
+    ) -> &'static str {
+        let deadline = tokio::time::Instant::now() + LOAD_DEADLINE;
+        let mut grace: Option<tokio::time::Instant> = None;
+        let mut last: Option<Shown> = None;
+        let mut unchanged_since = tokio::time::Instant::now();
+        let mut next_poll = tokio::time::Instant::now();
+        let mut cancelled: Option<tokio::time::Instant> = None;
+        let mut unanswered: Option<tokio::time::Instant> = None;
         loop {
+            // Everything already heard counts before anything is concluded.
+            let before = (watch.loaded, watch.quiet());
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) if channel.owns(&ev) => watch.see(&ev, frame),
+                    Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+            }
+            let now = tokio::time::Instant::now();
+            let mut linger = None;
+            match watch.settled {
+                // Loading stopped with no new document: cancelled — or a page
+                // coming back from the back/forward cache, whose commit is
+                // reported a moment after.
+                Some("cancelled") => {
+                    let until = *cancelled.get_or_insert(now + CANCEL_LINGER);
+                    if now >= until {
+                        return "cancelled";
+                    }
+                    linger = Some(until);
+                }
+                Some(why) => return why,
+                None => cancelled = None,
+            }
+            // Asked for, and nothing under way: a navigation that was dropped
+            // (the page refused it, or there was nowhere to go back to).
+            if !watch.coming && watch.loader.is_none() {
+                let until = *unanswered.get_or_insert(now + START_LINGER);
+                if now >= until {
+                    return "cancelled";
+                }
+                linger = Some(until);
+            }
+            // A dialog blocks the page: nothing more will load until it is answered.
+            if self.dialog.lock().await.is_some() {
+                return "dialog";
+            }
+            if now >= deadline {
+                return "deadline";
+            }
+            if !watch.parsed {
+                // A redirect started a new document: what was seen no longer counts.
+                (grace, last) = (None, None);
+            } else if now >= *grace.get_or_insert(now + READY_GRACE) {
+                return "grace";
+            } else if now >= next_poll || before != (watch.loaded, watch.quiet()) {
+                next_poll = now + READY_POLL;
+                let args = vec![json!(DEFAULT_MAX_CANDIDATES), json!(DEFAULT_TEXT_CHARS), json!("probe")];
+                let shown = self.call(&scripts::SNAPSHOT, args, false).await.ok().as_ref().and_then(Shown::parse);
+                if watch.loaded && shown.is_some_and(|s| !s.may_fill_in()) {
+                    return "load";
+                }
+                if shown.is_some() && shown == last && shown.is_some_and(|s| !s.blank()) {
+                    if watch.quiet() {
+                        return "quiet";
+                    }
+                    if unchanged_since.elapsed() >= STABLE_FOR {
+                        return "stable";
+                    }
+                } else {
+                    last = shown;
+                    unchanged_since = tokio::time::Instant::now();
+                }
+                continue;
+            }
+            let wake = linger.unwrap_or(if watch.parsed { next_poll.min(deadline) } else { deadline });
             tokio::select! {
                 ev = rx.recv() => match ev {
-                    Ok(ev) if channel.owns(&ev) && matches!(ev.method.as_str(), "Page.loadEventFired" | "Page.navigatedWithinDocument") => return,
+                    Ok(ev) if channel.owns(&ev) => watch.see(&ev, frame),
                     Ok(_) | Err(RecvError::Lagged(_)) => {}
-                    Err(RecvError::Closed) => return,
+                    Err(RecvError::Closed) => return "closed",
                 },
-                _ = tokio::time::sleep_until(deadline) => return,
+                _ = tokio::time::sleep_until(wake) => {}
             }
         }
     }
@@ -632,25 +903,18 @@ impl Tab {
         }
         let frame = res.get("frameId").and_then(Value::as_str).unwrap_or_default().to_string();
         let same_document = res.get("loaderId").is_none();
-        if !same_document {
-            let deadline = tokio::time::Instant::now() + LOAD_DEADLINE;
-            loop {
-                tokio::select! {
-                    ev = rx.recv() => match ev {
-                        Ok(ev) if channel.owns(&ev) => {
-                            let done = ev.method == "Page.loadEventFired"
-                                || (ev.method == "Page.frameStoppedLoading"
-                                    && ev.params.get("frameId").and_then(Value::as_str) == Some(frame.as_str()));
-                            if done { break; }
-                        }
-                        Ok(_) | Err(RecvError::Lagged(_)) => {}
-                        Err(RecvError::Closed) => break,
-                    },
-                    _ = tokio::time::sleep_until(deadline) => break,
-                }
-            }
-        }
-        self.observe_locked(DEFAULT_TEXT_CHARS, DEFAULT_MAX_CANDIDATES).await
+        let waiting = Instant::now();
+        let ready = if same_document {
+            "same_document"
+        } else {
+            let mut watch = NavWatch::coming();
+            self.wait_ready(&mut rx, &channel, &mut watch, &frame).await
+        };
+        let ready_ms = waiting.elapsed().as_millis() as u64;
+        let mut observation = self.observe_locked(DEFAULT_TEXT_CHARS, DEFAULT_MAX_CANDIDATES).await?;
+        observation["timing_ms"]["ready"] = json!(ready_ms);
+        observation["timing_ms"]["ready_by"] = json!(ready);
+        Ok(observation)
     }
 
     /// The whole page's readable text, for an LLM to read.
@@ -697,7 +961,141 @@ pub fn check_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_url;
+    use super::*;
+
+    const MAIN: &str = "F1";
+
+    fn event(method: &str, params: Value) -> CdpEvent {
+        CdpEvent { method: method.to_string(), params, session: None, tab: None }
+    }
+
+    fn watch(start: NavWatch, events: &[(&str, Value)]) -> NavWatch {
+        let mut w = start;
+        for (method, params) in events {
+            w.see(&event(method, params.clone()), MAIN);
+        }
+        w
+    }
+
+    fn commit(loader: &str) -> (&'static str, Value) {
+        ("Page.frameNavigated", json!({ "frame": { "id": MAIN, "loaderId": loader }, "type": "Navigation" }))
+    }
+
+    fn idle(loader: &str) -> (&'static str, Value) {
+        ("Page.lifecycleEvent", json!({ "frameId": MAIN, "loaderId": loader, "name": "networkIdle" }))
+    }
+
+    /// The events Chrome reports for a click on a link, in its order.
+    #[test]
+    fn a_clicked_link_is_followed_to_the_document_it_brings() {
+        let asked = [
+            ("Page.frameRequestedNavigation", json!({ "frameId": MAIN, "reason": "anchorClick" })),
+            ("Page.frameStartedNavigating", json!({ "frameId": MAIN, "navigationType": "differentDocument", "loaderId": "L2" })),
+            ("Page.frameStartedLoading", json!({ "frameId": MAIN })),
+        ];
+        let w = watch(NavWatch::default(), &asked);
+        assert!(w.started && w.coming && !w.parsed && w.settled.is_none(), "{w:?}");
+
+        let w = watch(w, &[commit("L2"), ("Page.domContentEventFired", json!({}))]);
+        assert!(w.parsed && !w.loaded && !w.quiet() && !w.coming, "{w:?}");
+        // Two requests left while the page loads are stragglers; two left after
+        // its load event may be all the data an app is waiting for.
+        let almost = ("Page.lifecycleEvent", json!({ "frameId": MAIN, "loaderId": "L2", "name": "networkAlmostIdle" }));
+        let w2 = watch(w.clone(), &[almost]);
+        assert!(w2.quiet(), "{w2:?}");
+        assert!(!watch(w2, &[("Page.loadEventFired", json!({}))]).quiet());
+        let w = watch(w, &[idle("L2"), ("Page.loadEventFired", json!({})), ("Page.frameStoppedLoading", json!({ "frameId": MAIN }))]);
+        assert!(w.quiet() && w.loaded && w.settled.is_none(), "{w:?}");
+    }
+
+    /// Until the new document commits, the page being left goes on reporting:
+    /// its load event, its idle network. None of that is the new page's.
+    #[test]
+    fn the_page_being_left_does_not_answer_for_the_new_one() {
+        let w = watch(
+            NavWatch::coming(),
+            &[("Page.domContentEventFired", json!({})), ("Page.loadEventFired", json!({})), idle("L1")],
+        );
+        assert!(!w.parsed && !w.loaded && !w.quiet(), "{w:?}");
+        // A document in a subframe is not the page either.
+        let w = watch(
+            w,
+            &[
+                ("Page.frameNavigated", json!({ "frame": { "id": "F2", "parentId": MAIN, "loaderId": "X" } })),
+                ("Page.frameStoppedLoading", json!({ "frameId": "F2" })),
+                ("Page.frameStartedNavigating", json!({ "frameId": "F2", "navigationType": "differentDocument" })),
+            ],
+        );
+        assert!(w.coming && w.loader.is_none() && w.settled.is_none(), "{w:?}");
+        // Nor is the idle network of an earlier document.
+        let w = watch(w, &[commit("L2"), ("Page.domContentEventFired", json!({})), idle("L1")]);
+        assert!(w.parsed && !w.quiet(), "{w:?}");
+    }
+
+    /// The history API fires loading events around a navigation that never
+    /// leaves the document (seen on real pages right after their load event).
+    #[test]
+    fn the_history_api_is_not_a_new_document() {
+        let loaded = watch(NavWatch::coming(), &[commit("L1"), ("Page.loadEventFired", json!({})), idle("L1")]);
+        let blip = [
+            ("Page.frameStartedLoading", json!({ "frameId": MAIN })),
+            ("Page.navigatedWithinDocument", json!({ "frameId": MAIN, "navigationType": "historyApi" })),
+            ("Page.frameStoppedLoading", json!({ "frameId": MAIN })),
+        ];
+        let w = watch(loaded, &blip);
+        assert!(w.loaded && w.quiet() && w.settled.is_none() && w.loader.as_deref() == Some("L1"), "{w:?}");
+
+        // On a page that was not navigating, it asks for nothing to wait on…
+        let w = watch(NavWatch::default(), &blip);
+        assert!(!w.started, "{w:?}");
+        // …and going back within the document ends at once.
+        let mut back = vec![("Page.frameStartedNavigating", json!({ "frameId": MAIN, "navigationType": "historySameDocument" }))];
+        back.extend(blip);
+        let w = watch(NavWatch { started: true, ..NavWatch::default() }, &back);
+        assert_eq!(w.settled, Some("same_document"), "{w:?}");
+    }
+
+    #[test]
+    fn a_restored_or_cancelled_navigation_has_nothing_to_wait_for() {
+        // Back/forward cache: loading stops, then the restored page is reported.
+        let back = [
+            ("Page.frameStartedNavigating", json!({ "frameId": MAIN, "navigationType": "historyDifferentDocument" })),
+            ("Page.frameStoppedLoading", json!({ "frameId": MAIN })),
+        ];
+        let w = watch(NavWatch { started: true, ..NavWatch::default() }, &back);
+        assert_eq!(w.settled, Some("cancelled"), "until the restored page is reported: {w:?}");
+        let restored = ("Page.frameNavigated", json!({ "frame": { "id": MAIN, "loaderId": "L0" }, "type": "BackForwardCacheRestore" }));
+        assert_eq!(watch(w, &[restored]).settled, Some("restored"));
+        // A redirect after the page was parsed starts over.
+        let w = watch(NavWatch::coming(), &[commit("L1"), ("Page.domContentEventFired", json!({}))]);
+        let w = watch(w, &[("Page.frameStartedNavigating", json!({ "frameId": MAIN, "navigationType": "differentDocument" }))]);
+        assert!(w.coming && !w.parsed && w.loader.is_none(), "{w:?}");
+    }
+
+    #[test]
+    fn an_app_shell_is_a_sparse_page_that_loads_scripts() {
+        let shown = |text: usize, controls: usize, scripts: u64| {
+            Shown::parse(&json!({ "digest": 7, "text": text, "controls": controls, "scripts": scripts })).unwrap()
+        };
+        assert!(shown(95, 15, 12).may_fill_in(), "a navigation bar and a spinner");
+        assert!(!shown(95, 15, 0).may_fill_in(), "no script: what it shows is what there is");
+        assert!(!shown(1500, 5, 12).may_fill_in(), "a page of text");
+        assert!(!shown(40, 60, 12).may_fill_in(), "a page of controls");
+        assert!(shown(0, 0, 3).blank() && !shown(0, 1, 3).blank());
+        // A probe that is not one (the page was navigating) is no answer.
+        assert!(Shown::parse(&json!({ "marker": [] })).is_none());
+        assert!(Shown::parse(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn a_link_that_opens_elsewhere_is_not_a_navigation_of_this_page() {
+        for disposition in ["newTab", "newWindow", "download"] {
+            let ev = ("Page.frameRequestedNavigation", json!({ "frameId": MAIN, "reason": "anchorClick", "disposition": disposition }));
+            assert!(!watch(NavWatch::default(), &[ev]).started, "{disposition}");
+        }
+        let here = ("Page.frameRequestedNavigation", json!({ "frameId": MAIN, "reason": "anchorClick", "disposition": "currentTab" }));
+        assert!(watch(NavWatch::default(), &[here]).started);
+    }
 
     #[test]
     fn only_web_urls_open() {

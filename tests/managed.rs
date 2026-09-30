@@ -226,3 +226,30 @@ async fn a_headless_page_sees_an_ordinary_chrome() {
     let text = page_log(&tab).await;
     assert!(text.contains("Chrome/") && !text.contains("Headless"), "{text}");
 }
+
+/// A toggle button (like, follow, mute) reports whether it is on, and a
+/// toggle that changed by itself since it was observed is not clicked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_toggle_button_says_whether_it_is_on() {
+    let Some((browser, _dir)) = browser() else { return };
+    let base = serve_fixtures().await;
+    let session = browser.open_session(DriverKind::Managed, Some("toggle"), Some(true)).await.unwrap();
+    let (tab, _) = browser.open_tab(&session, None, Some("chat-toggle")).await.unwrap();
+    let obs = tab.navigate(&format!("{base}/feed.html")).await.unwrap();
+    assert_eq!(action(&obs, "click", "Like first post")["checked"], "false");
+
+    let out = tab.act(obs_id(&obs), &id(action(&obs, "click", "Like first post")), None).await.unwrap();
+    let obs = out["observation"].clone();
+    assert_eq!(action(&obs, "click", "Like first post")["checked"], "true");
+
+    // Turn it off, then let the page turn it on behind the observation.
+    let out = tab.act(obs_id(&obs), &id(action(&obs, "click", "Like first post")), None).await.unwrap();
+    let obs = out["observation"].clone();
+    let out = tab.act(obs_id(&obs), &id(action(&obs, "click", "Flip the like")), None).await.unwrap();
+    let obs = out["observation"].clone();
+    assert_eq!(action(&obs, "click", "Like first post")["checked"], "false");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let err = tab.act(obs_id(&obs), &id(action(&obs, "click", "Like first post")), None).await.unwrap_err();
+    assert!(matches!(err, BrowserError::StalePage), "a like that is already on must not be clicked off: {err}");
+    browser.shutdown().await;
+}

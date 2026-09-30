@@ -87,7 +87,7 @@ function (maxCandidates, textChars, markerOnly) {
     return [identity(e), role(e), name(e), e.value ?? null, e.checked ?? null, e.selectedIndex ?? null,
       e.readOnly ?? null, e.matches(':disabled'), e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'), e.getAttribute('aria-checked'), e.getAttribute('aria-selected'),
-      e.getAttribute('href'), (scope && scope.innerText || '').slice(0, 6000)];
+      e.getAttribute('aria-pressed'), e.getAttribute('href'), (scope && scope.innerText || '').slice(0, 6000)];
   };
   cache.pageKey = pageKey;
   cache.guard = guard;
@@ -105,6 +105,8 @@ function (maxCandidates, textChars, markerOnly) {
         if (value !== null) base[key] = value;
       }
       if (['checkbox', 'radio'].includes(e.type)) base.checked = String(e.checked);
+      // A toggle button (like, follow, mute) says whether it is on the same way.
+      else if (base.checked === undefined && e.getAttribute('aria-pressed') !== null) base.checked = e.getAttribute('aria-pressed');
       if (sensitive(e)) base.sensitive = true;
       if (dx || dy) base.frame = true;
       if (e.tagName === 'SELECT') {

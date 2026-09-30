@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "sen-browser"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "SenClaw browser runtime: atomic page observation and guarded, trusted input over CDP, for a managed Chrome profile or the user's Chrome through the SenClaw extension"
 license = "MIT"
